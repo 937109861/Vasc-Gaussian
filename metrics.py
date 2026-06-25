@@ -1,0 +1,204 @@
+from pathlib import Path
+import hashlib
+import os
+from PIL import Image
+import torch
+import torchvision.transforms.functional as tf
+from utils.loss_utils import ssim
+from lpipsPyTorch import lpips
+import json
+from tqdm import tqdm
+from utils.image_utils import psnr
+from argparse import ArgumentParser
+
+
+def method_iteration(method):
+    if not method.startswith("ours_"):
+        return None
+    try:
+        return int(method.rsplit("_", 1)[-1])
+    except ValueError:
+        return None
+
+
+def select_methods(test_dir, iteration=-1, all_iterations=False):
+    methods = [
+        method
+        for method in os.listdir(test_dir)
+        if (test_dir / method).is_dir() and method_iteration(method) is not None
+    ]
+    methods = sorted(methods, key=method_iteration)
+    if all_iterations:
+        return methods
+    if not methods:
+        return []
+    if iteration < 0:
+        return [methods[-1]]
+    requested = "ours_{}".format(iteration)
+    return [requested] if requested in methods else []
+
+
+def directory_digest(directory, image_names):
+    digest = hashlib.sha256()
+    for name in image_names:
+        digest.update(name.encode("utf-8"))
+        with open(directory / name, "rb") as handle:
+            digest.update(handle.read())
+    return digest.hexdigest()
+
+
+def readImages(renders_dir, gt_dir):
+    renders = []
+    gts = []
+    image_names = []
+    render_names = {
+        name for name in os.listdir(renders_dir) if (renders_dir / name).is_file()
+    }
+    gt_names = {
+        name for name in os.listdir(gt_dir) if (gt_dir / name).is_file()
+    }
+    common_names = sorted(render_names & gt_names)
+    if not common_names:
+        raise ValueError(
+            "No matching render/GT images found in {} and {}".format(
+                renders_dir,
+                gt_dir,
+            )
+        )
+    if render_names != gt_names:
+        print(
+            "Warning: render/GT file sets differ; evaluating {} matching files".format(
+                len(common_names)
+            )
+        )
+    for fname in common_names:
+        render = Image.open(renders_dir / fname)
+        gt = Image.open(gt_dir / fname)
+        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
+        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
+        image_names.append(fname)
+    return renders, gts, image_names
+
+
+def evaluate(model_paths, iteration=-1, all_iterations=False):
+
+    full_dict = {}
+    per_view_dict = {}
+    full_dict_polytopeonly = {}
+    per_view_dict_polytopeonly = {}
+    print("")
+
+    for scene_dir in model_paths:
+        try:
+            print("Scene:", scene_dir)
+            full_dict[scene_dir] = {}
+            per_view_dict[scene_dir] = {}
+            full_dict_polytopeonly[scene_dir] = {}
+            per_view_dict_polytopeonly[scene_dir] = {}
+
+            test_dir = Path(scene_dir) / "test"
+
+            selected_methods = select_methods(
+                test_dir,
+                iteration=iteration,
+                all_iterations=all_iterations,
+            )
+            if not selected_methods:
+                raise FileNotFoundError(
+                    "No matching ours_* result found in {} for iteration {}".format(
+                        test_dir,
+                        iteration,
+                    )
+                )
+
+            print("Selected methods:", ", ".join(selected_methods))
+            for method in selected_methods:
+                print("Method:", method)
+
+                full_dict[scene_dir][method] = {}
+                per_view_dict[scene_dir][method] = {}
+                full_dict_polytopeonly[scene_dir][method] = {}
+                per_view_dict_polytopeonly[scene_dir][method] = {}
+
+                method_dir = test_dir / method
+                gt_dir = method_dir/ "gt"
+                renders_dir = method_dir / "renders"
+                render_stats_path = method_dir / "render_stats.json"
+                render_stats = {}
+                if render_stats_path.exists():
+                    with open(render_stats_path, "r", encoding="utf-8") as handle:
+                        render_stats = json.load(handle)
+                gt_space = render_stats.get("gt_space", "legacy_or_unknown")
+                if gt_space != "per_view_minmax_normalized":
+                    print(
+                        "  WARNING: GT space is {}; rerun render.py with the updated code".format(
+                            gt_space
+                        )
+                    )
+                checkpoint_sha256 = render_stats.get("checkpoint_sha256")
+                if checkpoint_sha256:
+                    print("  Checkpoint SHA256:", checkpoint_sha256)
+                renders, gts, image_names = readImages(renders_dir, gt_dir)
+                render_digest = directory_digest(renders_dir, image_names)
+                gt_digest = directory_digest(gt_dir, image_names)
+                print("  Render SHA256:", render_digest)
+                print("  GT SHA256    :", gt_digest)
+
+                ssims = []
+                psnrs = []
+                lpipss = []
+
+                for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
+                    ssims.append(ssim(renders[idx], gts[idx]))
+                    psnrs.append(psnr(renders[idx], gts[idx]))
+                    lpipss.append(lpips(renders[idx], gts[idx], net_type='vgg'))
+
+                print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
+                print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
+                print("  LPIPS: {:>12.7f}".format(torch.tensor(lpipss).mean(), ".5"))
+                print("")
+
+                full_dict[scene_dir][method].update({"SSIM": torch.tensor(ssims).mean().item(),
+                                                         "PSNR": torch.tensor(psnrs).mean().item(),
+                                                         "LPIPS": torch.tensor(lpipss).mean().item(),
+                                                         "num_views": len(image_names),
+                                                         "render_sha256": render_digest,
+                                                         "gt_sha256": gt_digest,
+                                                         "gt_space": gt_space,
+                                                         "checkpoint_sha256": checkpoint_sha256})
+                per_view_dict[scene_dir][method].update({"SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
+                                                            "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
+                                                            "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)}})
+
+            with open(scene_dir + "/results.json", 'w') as fp:
+                json.dump(full_dict[scene_dir], fp, indent=True)
+            with open(scene_dir + "/per_view.json", 'w') as fp:
+                json.dump(per_view_dict[scene_dir], fp, indent=True)
+        except Exception as error:
+            print("Metric error:", repr(error))
+            print("Unable to compute metrics for model", scene_dir)
+
+if __name__ == "__main__":
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+
+    # Set up command line argument parser
+    parser = ArgumentParser(description="Training script parameters")
+    parser.add_argument('--model_paths', '-m', required=True, nargs="+", type=str, default=[])
+    parser.add_argument(
+        "--iteration",
+        type=int,
+        default=-1,
+        help="Evaluate a specific ours_<iteration>. Default: latest iteration only.",
+    )
+    parser.add_argument(
+        "--all_iterations",
+        action="store_true",
+        help="Evaluate every ours_* directory.",
+    )
+    args = parser.parse_args()
+    evaluate(
+        args.model_paths,
+        iteration=args.iteration,
+        all_iterations=args.all_iterations,
+    )
