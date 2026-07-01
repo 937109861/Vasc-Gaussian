@@ -485,6 +485,8 @@ class GaussianModel_Xray:
         max_screen_size,
         grad_multipliers=None,
         extra_prune_mask=None,
+        prune_protect_mask=None,
+        densify_region_mask=None,
         density_aware_pruning=False,
         min_radiodensity=0.02,
         prune_density_mode="opacity",
@@ -496,6 +498,23 @@ class GaussianModel_Xray:
         original_count = grads.shape[0]
         if grad_multipliers is not None:
             grads = grads * grad_multipliers[:original_count].reshape(-1, 1)
+
+        densify_inside_count = None
+        densify_outside_count = None
+        if densify_region_mask is not None:
+            densify_region_mask = densify_region_mask[:original_count].to(device=grads.device, dtype=torch.bool)
+            grad_norm = torch.norm(grads, dim=-1)
+            clone_mask = torch.logical_and(
+                grad_norm >= max_grad,
+                torch.max(self.get_scaling[:original_count], dim=1).values <= self.percent_dense * extent,
+            )
+            split_mask = torch.logical_and(
+                grads.squeeze() >= max_grad,
+                torch.max(self.get_scaling[:original_count], dim=1).values > self.percent_dense * extent,
+            )
+            new_gaussian_sources = clone_mask.to(torch.int32) + 2 * split_mask.to(torch.int32)
+            densify_inside_count = int(new_gaussian_sources[densify_region_mask].sum().item())
+            densify_outside_count = int(new_gaussian_sources[~densify_region_mask].sum().item())
 
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
@@ -528,10 +547,30 @@ class GaussianModel_Xray:
                 padding = torch.zeros(prune_mask.shape[0] - original_count, device=prune_mask.device, dtype=torch.bool)
                 extra_prune_mask = torch.cat((extra_prune_mask, padding))
             prune_mask = torch.logical_or(prune_mask, extra_prune_mask)
+        if prune_protect_mask is not None:
+            prune_protect_mask = prune_protect_mask[:original_count].to(device=prune_mask.device, dtype=torch.bool)
+            if prune_mask.shape[0] > original_count:
+                padding = torch.zeros(prune_mask.shape[0] - original_count, device=prune_mask.device, dtype=torch.bool)
+                prune_protect_mask = torch.cat((prune_protect_mask, padding))
+            prune_mask = torch.logical_and(prune_mask, torch.logical_not(prune_protect_mask))
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        pruned_inside_roi = None
+        pruned_outside_roi = None
+        if densify_region_mask is not None:
+            prune_region_mask = densify_region_mask.to(device=prune_mask.device, dtype=torch.bool)
+            if prune_mask.shape[0] > prune_region_mask.shape[0]:
+                padding = torch.zeros(
+                    prune_mask.shape[0] - prune_region_mask.shape[0],
+                    device=prune_mask.device,
+                    dtype=torch.bool,
+                )
+                prune_region_mask = torch.cat((prune_region_mask, padding))
+            prune_region_mask = prune_region_mask[: prune_mask.shape[0]]
+            pruned_inside_roi = int(torch.logical_and(prune_mask, prune_region_mask).sum().item())
+            pruned_outside_roi = int(torch.logical_and(prune_mask, torch.logical_not(prune_region_mask)).sum().item())
         pruned_count = int(prune_mask.sum().item())
         self.prune_points(prune_mask)
         count_after_prune = int(self.get_xyz.shape[0])
@@ -547,6 +586,10 @@ class GaussianModel_Xray:
             "min_opacity": float(min_opacity),
             "min_radiodensity": float(min_radiodensity),
             "min_effective_density": float(min_effective_density),
+            "densified_inside_roi": densify_inside_count,
+            "densified_outside_roi": densify_outside_count,
+            "pruned_inside_roi": pruned_inside_roi,
+            "pruned_outside_roi": pruned_outside_roi,
         }
 
 

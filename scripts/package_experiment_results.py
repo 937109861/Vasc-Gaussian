@@ -57,6 +57,7 @@ IMPORTANT_DIR_NAMES = {
     "refinement",
     "occupancy_debug",
     "volume_debug",
+    "bridge_debug",
     "progress_renders",
 }
 

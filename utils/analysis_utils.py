@@ -178,6 +178,16 @@ def export_gaussian_statistics(model_path, iteration, gaussians, bins=20, alloca
             "empty_occupancy_gaussian_ratio": allocation_stats.get("empty_occupancy_gaussian_ratio"),
             "num_extra_prune_candidates": allocation_stats.get("num_extra_prune_candidates"),
             "empty_prune_mask_source": allocation_stats.get("empty_prune_mask_source"),
+            "num_vessel_gaussians": allocation_stats.get("num_vessel_gaussians"),
+            "vessel_gaussian_ratio": allocation_stats.get("vessel_gaussian_ratio"),
+            "num_outside_vessel_gaussians": allocation_stats.get("num_outside_vessel_gaussians"),
+            "outside_vessel_gaussian_ratio": allocation_stats.get("outside_vessel_gaussian_ratio"),
+            "num_centerline_protected_gaussians": allocation_stats.get("num_centerline_protected_gaussians"),
+            "centerline_protected_gaussian_ratio": allocation_stats.get("centerline_protected_gaussian_ratio"),
+            "topology_mask_components": allocation_stats.get("topology_mask_components"),
+            "topology_small_component_count": allocation_stats.get("topology_small_component_count"),
+            "topology_largest_component_ratio": allocation_stats.get("topology_largest_component_ratio"),
+            "centerline_voxels": allocation_stats.get("centerline_voxels"),
         })
     append_jsonl(
         os.path.join(model_path, "analysis", "gaussian_stats_history.jsonl"),

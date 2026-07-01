@@ -88,6 +88,32 @@ def gaussian_density_weights_extended(gaussians, mode):
     raise ValueError(f"Unsupported density mapping mode: {mode}")
 
 
+def array_stats(name, values):
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return {
+            f"{name}_finite_count": 0,
+            f"{name}_nonzero_count": 0,
+            f"{name}_min": 0.0,
+            f"{name}_max": 0.0,
+            f"{name}_mean": 0.0,
+            f"{name}_p50": 0.0,
+            f"{name}_p90": 0.0,
+            f"{name}_p99": 0.0,
+        }
+    return {
+        f"{name}_finite_count": int(finite.size),
+        f"{name}_nonzero_count": int(np.count_nonzero(finite)),
+        f"{name}_min": float(finite.min()),
+        f"{name}_max": float(finite.max()),
+        f"{name}_mean": float(finite.mean()),
+        f"{name}_p50": float(np.percentile(finite, 50.0)),
+        f"{name}_p90": float(np.percentile(finite, 90.0)),
+        f"{name}_p99": float(np.percentile(finite, 99.0)),
+    }
+
+
 def normalize_volume(volume):
     volume = volume.astype(np.float32, copy=False)
     vmin = float(volume.min())
@@ -430,10 +456,22 @@ def main():
     scales = gaussians.get_scaling.detach().cpu().numpy().astype(np.float32)
     density_mode = args.density_mapping_mode or args.density
     weights = gaussian_density_weights_extended(gaussians, density_mode)
+    opacity_values = gaussians.get_opacity.detach().reshape(-1).cpu().numpy().astype(np.float32)
+    if hasattr(gaussians, "get_radiodensity"):
+        radiodensity_values = gaussians.get_radiodensity.detach().reshape(-1).cpu().numpy().astype(np.float32)
+    else:
+        radiodensity_values = np.zeros_like(opacity_values, dtype=np.float32)
     export_extra_stats = {
         "export_mode": args.export_mode,
         "density_mapping_mode": density_mode,
         "use_roi_gate": bool(args.use_roi_gate),
+        **array_stats("density_weight_initial", weights),
+        **array_stats("opacity", opacity_values),
+        **array_stats("radiodensity", radiodensity_values),
+        "xyz_min": xyz.min(axis=0).tolist() if xyz.size else [0.0, 0.0, 0.0],
+        "xyz_max": xyz.max(axis=0).tolist() if xyz.size else [0.0, 0.0, 0.0],
+        "scale_min": scales.min(axis=0).tolist() if scales.size else [0.0, 0.0, 0.0],
+        "scale_max": scales.max(axis=0).tolist() if scales.size else [0.0, 0.0, 0.0],
     }
     roi_mask = None
     occupancy_mask = None
@@ -474,6 +512,7 @@ def main():
     else:
         weights, calibration_stats = calibrate_density_weights(weights, mode="none")
         export_extra_stats.update(calibration_stats)
+    export_extra_stats.update(array_stats("density_weight_export", weights))
 
     mode_stats = {}
     if args.mode == "center":

@@ -6,7 +6,11 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render
 import sys
 from scene import Scene, GaussianModel_Xray
-from refinement import PriorRefinementController, ProjectionSupportController
+from refinement import (
+    PriorRefinementController,
+    ProjectionSupportController,
+    TopologyAwareGaussianController,
+)
 from losses import (
     LowResPriorOccupancyLoss,
     LowResVolumeLoss,
@@ -69,6 +73,7 @@ def training(
     occupancy_loss = None
     volume_loss = None
     projection_support_controller = None
+    topology_gaussian_controller = None
     if getattr(opt, "use_projection_support_loss", False):
         exp_logger.info(
             "Enabled projection support loss: "
@@ -137,6 +142,44 @@ def training(
         )
         analysis_description = prior_analysis_controller.save_description(dataset.model_path)
         exp_logger.info(f"Enabled prior allocation analysis: {analysis_description}")
+    if getattr(opt, "use_topology_gaussian_prior", False):
+        topology_prior_path = getattr(opt, "topology_prior_path", "")
+        topology_base_prior_path = getattr(opt, "refinement_prior_path", "") or getattr(dataset, "prior_path", "")
+        if not topology_base_prior_path:
+            raise ValueError("use_topology_gaussian_prior requires prior_path or refinement_prior_path")
+        if scene.volume_positions is None:
+            raise ValueError("Topology Gaussian prior requires X-ray volume positions from the scene")
+        topology_gaussian_controller = TopologyAwareGaussianController(
+            prior_path=topology_base_prior_path,
+            topology_prior_path=topology_prior_path,
+            volume_positions=scene.volume_positions,
+            roi_source=getattr(opt, "topology_roi_source", "support_roi"),
+            roi_densify_weight=getattr(opt, "topology_roi_densify_weight", 1.25),
+            outside_densify_weight=getattr(opt, "topology_outside_densify_weight", 0.75),
+            outside_grid_densify_weight=getattr(opt, "topology_outside_grid_densify_weight", 0.50),
+            empty_prune_enabled=getattr(opt, "topology_empty_prune_enabled", False),
+            empty_prune_mask_source=getattr(opt, "topology_empty_prune_mask_source", "vessel"),
+            empty_prune_density_mode=getattr(opt, "topology_empty_prune_density_mode", "effective_density"),
+            empty_prune_threshold=getattr(opt, "topology_empty_prune_threshold", 0.002),
+            centerline_enabled=getattr(opt, "topology_centerline_enabled", False),
+            centerline_protect_distance=getattr(opt, "topology_centerline_protect_distance", 0.08),
+            centerline_far_distance=getattr(opt, "topology_centerline_far_distance", 0.35),
+            centerline_prune_threshold=getattr(opt, "topology_centerline_prune_threshold", 0.0015),
+            soft_empty_margin=getattr(opt, "topology_soft_empty_margin", 0.05),
+            soft_empty_tau=getattr(opt, "topology_soft_empty_tau", 0.05),
+            soft_empty_density_mode=getattr(opt, "topology_soft_empty_density_mode", "opacity"),
+            component_small_voxels=getattr(opt, "topology_component_small_voxels", 260),
+        )
+        prior_analysis_controller = topology_gaussian_controller
+        topology_description = topology_gaussian_controller.save_description(dataset.model_path)
+        exp_logger.info(
+            "Enabled topology-aware Gaussian management: "
+            f"{topology_description}, "
+            f"from={getattr(opt, 'topology_prior_from_iter', 5000)}, "
+            f"centerline_from={getattr(opt, 'topology_centerline_from_iter', 8000)}, "
+            f"roi_weight={getattr(opt, 'topology_roi_densify_weight', 1.25)}, "
+            f"outside_weight={getattr(opt, 'topology_outside_densify_weight', 0.75)}"
+        )
     if getattr(opt, "use_occ_loss", False):
         occ_prior_path = getattr(opt, "refinement_prior_path", "") or getattr(dataset, "prior_path", "")
         if not occ_prior_path:
@@ -295,6 +338,8 @@ def training(
         scale_aniso_loss = torch.zeros((), dtype=image.dtype, device=image.device)
         density_entropy_loss = torch.zeros((), dtype=image.dtype, device=image.device)
         density_sparsity_loss = torch.zeros((), dtype=image.dtype, device=image.device)
+        topology_empty_loss = torch.zeros((), dtype=image.dtype, device=image.device)
+        topology_empty_stats = {}
         gaussian_reg_stats = {}
         if getattr(opt, "use_gaussian_reg", False):
             scale_floor_loss, scale_aniso_loss, scale_stats = gaussian_scale_regularization(
@@ -315,6 +360,13 @@ def training(
                 mode=getattr(opt, "density_sparsity_mode", "radiodensity"),
             )
             gaussian_reg_stats.update(density_sparsity_stats)
+        topology_empty_loss_active = (
+            topology_gaussian_controller is not None
+            and getattr(opt, "lambda_topology_empty", 0.0) > 0.0
+            and iteration >= getattr(opt, "topology_empty_loss_from_iter", 10000)
+        )
+        if topology_empty_loss_active:
+            topology_empty_loss, topology_empty_stats = topology_gaussian_controller.soft_empty_loss(gaussians)
         loss = (
             getattr(opt, "lambda_render", 1.0) * base_loss
             + getattr(opt, "lambda_projection_foreground", 0.0) * projection_foreground_loss
@@ -326,6 +378,7 @@ def training(
             + getattr(opt, "lambda_scale_aniso", 0.0) * scale_aniso_loss
             + getattr(opt, "lambda_density_entropy", 0.0) * density_entropy_loss
             + getattr(opt, "lambda_density_sparsity", 0.0) * density_sparsity_loss
+            + getattr(opt, "lambda_topology_empty", 0.0) * topology_empty_loss
         )
         loss.backward()
 
@@ -392,6 +445,10 @@ def training(
                         "density_sparsity_active": bool(density_sparsity_active),
                         "density_sparsity_from_iter": int(getattr(opt, "density_sparsity_from_iter", 0)),
                         **gaussian_reg_stats,
+                        "topology_empty_loss": float(topology_empty_loss.item()),
+                        "lambda_topology_empty": float(getattr(opt, "lambda_topology_empty", 0.0)),
+                        "topology_empty_loss_active": bool(topology_empty_loss_active),
+                        **topology_empty_stats,
                         "total_loss": float(loss.item()),
                     },
                 )
@@ -416,6 +473,53 @@ def training(
                     volume_pred_grid,
                     volume_target_grid,
                     os.path.join(dataset.model_path, "volume_debug", f"iteration_{iteration}"),
+                )
+            topology_prune_only_active = (
+                topology_gaussian_controller is not None
+                and getattr(opt, "topology_empty_prune_enabled", False)
+                and iteration >= getattr(opt, "topology_empty_prune_from_iter", 10000)
+                and iteration <= getattr(opt, "topology_prune_only_until_iter", opt.iterations)
+                and iteration >= getattr(opt, "densify_until_iter", 15000)
+                and iteration % max(1, int(getattr(opt, "topology_prune_only_interval", 400))) == 0
+            )
+            if topology_prune_only_active:
+                centerline_active = iteration >= getattr(opt, "topology_centerline_from_iter", 8000)
+                (
+                    _,
+                    topology_prune_mask,
+                    topology_protect_mask,
+                    topology_region_mask,
+                    topology_stats,
+                ) = topology_gaussian_controller.build_iteration_bias(
+                    gaussians,
+                    centerline_active=centerline_active,
+                    empty_prune_active=True,
+                )
+                prune_mask = torch.logical_and(
+                    topology_prune_mask,
+                    torch.logical_not(topology_protect_mask),
+                )
+                count_before_prune = int(gaussians.get_xyz.shape[0])
+                pruned_inside_roi = int(torch.logical_and(prune_mask, topology_region_mask).sum().item())
+                pruned_outside_roi = int(
+                    torch.logical_and(prune_mask, torch.logical_not(topology_region_mask)).sum().item()
+                )
+                pruned_count = int(prune_mask.sum().item())
+                if pruned_count > 0:
+                    gaussians.prune_points(prune_mask)
+                    torch.cuda.empty_cache()
+                append_jsonl(
+                    os.path.join(dataset.model_path, "topology_gaussian_prior", "prune_only_history.jsonl"),
+                    {
+                        "iteration": int(iteration),
+                        "topology_prune_only_active": True,
+                        "count_before_prune": count_before_prune,
+                        "pruned_count": pruned_count,
+                        "count_after_prune": int(gaussians.get_xyz.shape[0]),
+                        "pruned_inside_roi": pruned_inside_roi,
+                        "pruned_outside_roi": pruned_outside_roi,
+                        **topology_stats,
+                    },
                 )
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -450,7 +554,10 @@ def training(
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     grad_multipliers = None
                     extra_prune_mask = None
+                    prune_protect_mask = None
+                    densify_region_mask = None
                     projection_support_stats = {}
+                    topology_stats = {}
                     if refinement_controller is not None and iteration >= getattr(opt, "refinement_from_iter", 0):
                         refinement_grad_multipliers, refinement_extra_prune_mask, refinement_stats = refinement_controller.build_iteration_bias(gaussians)
                         if getattr(opt, "roi_densify_enabled", False):
@@ -464,6 +571,46 @@ def training(
                                 "roi_densify_enabled": bool(getattr(opt, "roi_densify_enabled", False)),
                                 "empty_prune_enabled": bool(getattr(opt, "empty_prune_enabled", False)),
                                 **refinement_stats,
+                            },
+                        )
+                    topology_prior_active = (
+                        topology_gaussian_controller is not None
+                        and iteration >= getattr(opt, "topology_prior_from_iter", 5000)
+                    )
+                    if topology_prior_active:
+                        centerline_active = iteration >= getattr(opt, "topology_centerline_from_iter", 8000)
+                        empty_prune_active = iteration >= getattr(opt, "topology_empty_prune_from_iter", 10000)
+                        (
+                            topology_grad_multipliers,
+                            topology_prune_mask,
+                            topology_protect_mask,
+                            topology_region_mask,
+                            topology_stats,
+                        ) = topology_gaussian_controller.build_iteration_bias(
+                            gaussians,
+                            centerline_active=centerline_active,
+                            empty_prune_active=empty_prune_active,
+                        )
+                        topology_grad_multipliers = topology_grad_multipliers.reshape(-1, 1)
+                        if grad_multipliers is None:
+                            grad_multipliers = topology_grad_multipliers
+                        else:
+                            grad_multipliers = grad_multipliers.reshape(-1, 1) * topology_grad_multipliers
+                        if extra_prune_mask is None:
+                            extra_prune_mask = topology_prune_mask
+                        else:
+                            extra_prune_mask = torch.logical_or(extra_prune_mask, topology_prune_mask)
+                        if prune_protect_mask is None:
+                            prune_protect_mask = topology_protect_mask
+                        else:
+                            prune_protect_mask = torch.logical_or(prune_protect_mask, topology_protect_mask)
+                        densify_region_mask = topology_region_mask
+                        append_jsonl(
+                            os.path.join(dataset.model_path, "topology_gaussian_prior", "history.jsonl"),
+                            {
+                                "iteration": int(iteration),
+                                "topology_prior_active": bool(topology_prior_active),
+                                **topology_stats,
                             },
                         )
                     projection_support_active = (
@@ -513,6 +660,8 @@ def training(
                         min_radiodensity=getattr(opt, "prune_min_radiodensity", 0.02),
                         prune_density_mode=prune_density_mode,
                         min_effective_density=getattr(opt, "prune_min_effective_density", 0.0),
+                        prune_protect_mask=prune_protect_mask,
+                        densify_region_mask=densify_region_mask,
                     )
                     append_jsonl(
                         os.path.join(dataset.model_path, "densification_history.jsonl"),
@@ -522,7 +671,9 @@ def training(
                             "configured_prune_density_mode": configured_prune_density_mode,
                             "prune_density_from_iter": int(getattr(opt, "prune_density_from_iter", 0)),
                             "projection_support_active": bool(projection_support_active),
+                            "topology_prior_active": bool(topology_prior_active),
                             **projection_support_stats,
+                            **topology_stats,
                             **densification_stats,
                         },
                     )

@@ -15,6 +15,7 @@ dependencies:
   - tqdm
   - imageio
   - pyyaml
+  - scipy
   - pip:
     - submodules/diff-gaussian-rasterization
     - submodules/simple-knn
