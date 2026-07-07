@@ -215,9 +215,11 @@ class OptimizationParams(ParamGroup):
         self.volume_debug_interval = 0
         self.use_gaussian_reg = False
         self.scale_floor = 0.75
+        self.scale_max_axis = 0.0
         self.scale_aniso_max_ratio = 5.0
         self.scale_aniso_loss_mode = "linear"
         self.lambda_scale_floor = 0.0
+        self.lambda_scale_max = 0.0
         self.lambda_scale_aniso = 0.0
         self.lambda_density_entropy = 0.0
         self.lambda_density_sparsity = 0.0

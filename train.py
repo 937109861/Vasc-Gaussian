@@ -335,6 +335,7 @@ def training(
         if volume_loss_active:
             volume_loss_value, volume_stats, volume_pred_grid, volume_target_grid = volume_loss(gaussians)
         scale_floor_loss = torch.zeros((), dtype=image.dtype, device=image.device)
+        scale_max_loss = torch.zeros((), dtype=image.dtype, device=image.device)
         scale_aniso_loss = torch.zeros((), dtype=image.dtype, device=image.device)
         density_entropy_loss = torch.zeros((), dtype=image.dtype, device=image.device)
         density_sparsity_loss = torch.zeros((), dtype=image.dtype, device=image.device)
@@ -342,9 +343,10 @@ def training(
         topology_empty_stats = {}
         gaussian_reg_stats = {}
         if getattr(opt, "use_gaussian_reg", False):
-            scale_floor_loss, scale_aniso_loss, scale_stats = gaussian_scale_regularization(
+            scale_floor_loss, scale_max_loss, scale_aniso_loss, scale_stats = gaussian_scale_regularization(
                 gaussians,
                 scale_floor=getattr(opt, "scale_floor", 0.75),
+                scale_max_axis=getattr(opt, "scale_max_axis", 0.0),
                 max_anisotropy=getattr(opt, "scale_aniso_max_ratio", 5.0),
                 anisotropy_loss_mode=getattr(opt, "scale_aniso_loss_mode", "linear"),
             )
@@ -375,6 +377,7 @@ def training(
             + getattr(opt, "lambda_occ", 0.0) * occ_loss_value
             + getattr(opt, "lambda_volume", 0.0) * volume_loss_value
             + getattr(opt, "lambda_scale_floor", 0.0) * scale_floor_loss
+            + getattr(opt, "lambda_scale_max", 0.0) * scale_max_loss
             + getattr(opt, "lambda_scale_aniso", 0.0) * scale_aniso_loss
             + getattr(opt, "lambda_density_entropy", 0.0) * density_entropy_loss
             + getattr(opt, "lambda_density_sparsity", 0.0) * density_sparsity_loss
@@ -438,6 +441,7 @@ def training(
                         **volume_stats,
                         "use_gaussian_reg": bool(getattr(opt, "use_gaussian_reg", False)),
                         "lambda_scale_floor": float(getattr(opt, "lambda_scale_floor", 0.0)),
+                        "lambda_scale_max": float(getattr(opt, "lambda_scale_max", 0.0)),
                         "lambda_scale_aniso": float(getattr(opt, "lambda_scale_aniso", 0.0)),
                         "lambda_density_entropy": float(getattr(opt, "lambda_density_entropy", 0.0)),
                         "lambda_density_sparsity": float(getattr(opt, "lambda_density_sparsity", 0.0)),

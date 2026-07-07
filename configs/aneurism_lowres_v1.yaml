@@ -1,0 +1,143 @@
+scene: aneurism_lowres_v1
+source_path: data/aneurism_50.pickle
+model_path: ./output/volume_main/aneurism_lowres_v1
+iterations: 30000
+
+# Thin-vessel variant.
+# Goal: preserve and brighten continuous thin vessels while suppressing isolated
+# false-positive speckles through projection/background losses and later Slicer
+# display filtering. PriorNet remains a weak soft guide only.
+density_render_mode: effective_density
+density_render_constant_color: true
+
+lambda_render: 0.22
+lambda_dssim: 0.2
+
+use_projection_support_loss: true
+lambda_projection_foreground: 0.08
+lambda_projection_background: 0.36
+projection_foreground_threshold: 0.018
+projection_mask_dilation: 1
+projection_background_margin: 0.01
+
+use_projection_support_refinement: false
+projection_support_from_iter: 4000
+projection_support_until_iter: 12000
+projection_support_interval: 400
+projection_support_max_views: 8
+projection_support_foreground_threshold: 0.018
+projection_support_mask_dilation: 1
+projection_support_min_ratio: 0.22
+projection_support_min_observations: 8
+projection_support_densify_floor: 0.25
+projection_support_prune_max_effective_density: 0.015
+projection_support_chunk_size: 10000
+
+position_lr_init: 0.00014
+position_lr_final: 0.0000014
+position_lr_delay_mult: 0.01
+position_lr_max_steps: 30000
+feature_lr: 0.0
+opacity_lr: 0.005
+radiodensity_lr: 0.004
+scaling_lr: 0.003
+rotation_lr: 0.001
+percent_dense: 0.005
+
+densification_interval: 400
+opacity_reset_interval: 5000
+radiodensity_reset_interval: 2000
+densify_from_iter: 500
+densify_until_iter: 10000
+densify_grad_threshold: 0.00004
+densify_min_opacity: 0.005
+prune_density_mode: effective_density
+prune_min_effective_density: 0.002
+prune_density_from_iter: 3000
+random_background: false
+
+interval: 3
+acui_jitter: 0.10
+train_num: 50
+eval: true
+test_iterations: [1000, 2000, 5000, 10000, 20000, 30000]
+save_iterations: [10000, 20000, 30000]
+checkpoint_iterations: [10000, 20000]
+render_iterations: [10000, 30000]
+analysis_iterations: [1000, 5000, 10000, 20000, 30000]
+render_num_views: -1
+analysis_bins: 20
+
+init_mode: acui
+init_anisotropy_ratio: 3.0
+prior_source: gt
+prior_path: output/priors/aneurism_priornet/prior_data.npz
+prior_threshold_mode: quantile
+prior_threshold_value: 0.975
+prior_max_points: 10000
+hybrid_prior_points: 0
+hybrid_acui_points: 10000
+save_init_analysis: true
+
+use_prior_refinement: false
+refinement_prior_path: output/priors/aneurism_priornet/prior_data.npz
+refinement_from_iter: 1000
+roi_densify_enabled: false
+roi_densify_weight: 1.0
+empty_prune_enabled: false
+empty_prune_opacity: 0.012
+empty_prune_mask_source: roi
+
+use_occ_loss: true
+occ_grid_size: 64
+occ_loss_type: l1
+lambda_occ: 0.00008
+occ_source: soft
+occ_warmup_from_iter: 2000
+occ_debug_interval: 1000
+
+use_edge_loss: false
+
+use_volume_loss: true
+volume_grid_size: 64
+volume_loss_type: l1
+lambda_volume: 0.025
+volume_density_mode: effective_density
+volume_splat_mode: trilinear
+volume_splat_radius: 1
+volume_min_sigma_voxels: 0.35
+volume_max_sigma_voxels: 3.2
+volume_dgr_sigma_scale: 1.00
+volume_dgr_normalize_kernel: false
+volume_dgr_supersample: 1
+volume_dgr_kernel_cutoff: 0.0
+volume_dgr_max_splat_radius: 0
+volume_loss_interval: 100
+volume_warmup_from_iter: 2500
+volume_use_prior_mask: false
+volume_tissue_balance: true
+volume_sparse_foreground_balance: true
+volume_foreground_weight: 10.0
+volume_foreground_epsilon: 0.000001
+volume_soft_tissue_weight: 22.0
+volume_hard_tissue_weight: 36.0
+volume_soft_tissue_min_quantile: 0.04
+volume_soft_tissue_max_quantile: 0.72
+volume_hard_tissue_min_quantile: 0.90
+volume_roi_weight: 1.0
+volume_background_weight: 0.04
+volume_background_suppression_weight: 3.2
+volume_background_suppression_threshold: 0.0015
+volume_tv_weight: 0.00005
+volume_debug_interval: 5000
+
+use_gaussian_reg: true
+scale_floor: 0.12
+scale_aniso_max_ratio: 20.0
+scale_aniso_loss_mode: log
+lambda_scale_floor: 0.0003
+lambda_scale_aniso: 0.0006
+lambda_density_entropy: 0.0
+lambda_density_sparsity: 0.0008
+density_sparsity_mode: effective_density
+density_sparsity_from_iter: 3000

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 def gaussian_scale_regularization(
     gaussians,
     scale_floor=0.75,
+    scale_max_axis=0.0,
     max_anisotropy=5.0,
     anisotropy_loss_mode="linear",
 ):
@@ -15,6 +16,12 @@ def gaussian_scale_regularization(
     max_scale = torch.amax(scales, dim=1)
 
     floor_loss = F.relu(float(scale_floor) - min_scale).mean()
+    scale_max_axis = float(scale_max_axis)
+    if scale_max_axis > 0.0:
+        max_axis_loss = torch.square(F.relu(max_scale - scale_max_axis)).mean()
+    else:
+        max_axis_loss = torch.zeros((), dtype=scales.dtype, device=scales.device)
+
     ratio = max_scale / torch.clamp(min_scale, min=1e-6)
     max_anisotropy = max(float(max_anisotropy), 1.0)
     if anisotropy_loss_mode == "linear":
@@ -30,17 +37,24 @@ def gaussian_scale_regularization(
 
     stats = {
         "scale_floor": float(scale_floor),
+        "scale_max_axis": float(scale_max_axis),
         "scale_aniso_max_ratio": max_anisotropy,
         "scale_aniso_loss_mode": anisotropy_loss_mode,
         "scale_floor_loss": float(floor_loss.detach().item()),
+        "scale_max_axis_loss": float(max_axis_loss.detach().item()),
         "scale_aniso_loss": float(aniso_loss.detach().item()),
         "scale_min_mean": float(min_scale.detach().mean().item()),
+        "scale_max_mean": float(max_scale.detach().mean().item()),
+        "scale_max_median": float(torch.quantile(max_scale.detach(), 0.50).item()) if max_scale.numel() else 0.0,
+        "scale_max_p95": float(torch.quantile(max_scale.detach(), 0.95).item()) if max_scale.numel() else 0.0,
+        "scale_max_p99": float(torch.quantile(max_scale.detach(), 0.99).item()) if max_scale.numel() else 0.0,
+        "scale_max_value": float(torch.amax(max_scale.detach()).item()) if max_scale.numel() else 0.0,
         "scale_ratio_mean": float(ratio.detach().mean().item()),
         "scale_ratio_median": float(torch.quantile(ratio.detach(), 0.50).item()) if ratio.numel() else 0.0,
         "scale_ratio_p95": float(torch.quantile(ratio.detach(), 0.95).item()) if ratio.numel() else 0.0,
         "scale_ratio_max": float(torch.amax(ratio.detach()).item()) if ratio.numel() else 0.0,
     }
-    return floor_loss, aniso_loss, stats
+    return floor_loss, max_axis_loss, aniso_loss, stats
 
 
 def radiodensity_entropy_regularization(gaussians):
