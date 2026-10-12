@@ -11,6 +11,7 @@ from .structure_losses import (
 )
 from .volume_loss import LowResVolumeLoss
 from .prior_net_loss import dice_loss, prior_structure_loss, tv3d_loss
+from .vessel_projection_loss import vessel_weighted_l1_loss, vessel_weighted_sobel_loss
 
 __all__ = [
     "LowResPriorOccupancyLoss",
@@ -24,4 +25,6 @@ __all__ = [
     "prior_structure_loss",
     "sobel_edge_loss",
     "tv3d_loss",
+    "vessel_weighted_l1_loss",
+    "vessel_weighted_sobel_loss",
 ]

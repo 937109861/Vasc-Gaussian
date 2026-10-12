@@ -1,5 +1,7 @@
 import os
 import torch
+import numpy as np
+import imageio.v2 as imageio
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 # from pytorch_msssim import ssim
@@ -11,6 +13,12 @@ from refinement import (
     ProjectionSupportController,
     TopologyAwareGaussianController,
 )
+from refinement.paper_vessel_management import (
+    FixedPriorVolume,
+    PaperVesselManagementConfig,
+    compute_paper_vessel_management,
+)
+from refinement.dynamic_prior import DynamicPriorManager
 from losses import (
     LowResPriorOccupancyLoss,
     LowResVolumeLoss,
@@ -20,6 +28,8 @@ from losses import (
     projection_support_losses,
     radiodensity_entropy_regularization,
     sobel_edge_loss,
+    vessel_weighted_l1_loss,
+    vessel_weighted_sobel_loss,
 )
 from utils.general_utils import safe_state, gen_log
 from tqdm import tqdm
@@ -41,39 +51,153 @@ from utils.analysis_utils import (
 from pdb import set_trace as stx
 
 
-def training(
-    dataset,
-    opt,
-    pipe,
-    testing_iterations,
-    saving_iterations,
-    checkpoint_iterations,
-    checkpoint,
-    debug_from,
-    render_iterations,
-    analysis_iterations,
-):
-    first_iter = 0
-    dataset.density_render_mode = getattr(pipe, "density_render_mode", "legacy")
-    dataset.density_render_constant_color = getattr(
-        pipe,
-        "density_render_constant_color",
-        False,
-    )
-    exp_logger = prepare_output_and_logger(dataset)
-    exp_logger.info("Training parameters: {}".format(vars(opt)))
-    exp_logger.info("Pipeline parameters: {}".format(vars(pipe)))
+def _to_numpy_image(image):
+    array = image.detach().float().cpu().squeeze().numpy()
+    if array.max() > array.min():
+        array = (array - array.min()) / max(float(array.max() - array.min()), 1e-6)
+    else:
+        array = np.zeros_like(array, dtype=np.float32)
+    return (np.clip(array, 0.0, 1.0) * 255).astype(np.uint8)
 
-    gaussians = GaussianModel_Xray(dataset.sh_degree)
-    scene = Scene(dataset, gaussians)
-    save_dataset_split(dataset.model_path, scene)
-    gaussians.training_setup(opt)
+
+def _attach_vessel_projection_weights(scene, opt, exp_logger):
+    use_weighted_residual = bool(getattr(opt, "use_vessel_weighted_projection", False)) and (
+        float(getattr(opt, "vessel_projection_weight", 0.0)) != 0.0
+    )
+    use_vessel_edge = bool(getattr(opt, "use_vessel_projection_edge_loss", False)) and (
+        float(getattr(opt, "lambda_vessel_projection_edge", 0.0)) != 0.0
+    ) and (
+        float(getattr(opt, "vessel_projection_edge_weight", 1.0)) != 0.0
+    )
+    if not use_weighted_residual and not use_vessel_edge:
+        if getattr(opt, "use_vessel_weighted_projection", False):
+            exp_logger.info("Vessel-weighted projection is enabled but vessel_projection_weight=0; using baseline L1.")
+        return False
+
+    weight_path = getattr(opt, "vessel_projection_weight_path", "")
+    if not weight_path:
+        raise ValueError("vessel projection weighting/edge loss requires vessel_projection_weight_path")
+    payload = np.load(weight_path)
+    if "train_weights" not in payload:
+        raise KeyError(f"vessel projection cache must contain train_weights: {weight_path}")
+    train_weights = np.asarray(payload["train_weights"], dtype=np.float32)
+    if not np.all(np.isfinite(train_weights)):
+        raise ValueError(f"vessel projection cache contains NaN or Inf: {weight_path}")
+
+    attached = 0
+    for camera in scene.getTrainCameras():
+        index = int(getattr(camera, "colmap_id", camera.uid))
+        if index < 0 or index >= train_weights.shape[0]:
+            raise IndexError(
+                f"Camera colmap_id={index} is outside train_weights with {train_weights.shape[0]} views"
+            )
+        weight = train_weights[index]
+        expected_shape = (
+            int(camera.image_height),
+            int(camera.image_width),
+        )
+        if tuple(weight.shape) != expected_shape:
+            raise ValueError(
+                f"Vessel weight for camera {index} has shape {weight.shape}, expected {expected_shape}"
+            )
+        tensor = torch.from_numpy(weight).to(
+            device=camera.normalized_image.device,
+            dtype=camera.normalized_image.dtype,
+        ).unsqueeze(0)
+        camera.vessel_projection_weight = tensor
+        attached += 1
+
+    exp_logger.info(
+        "Enabled vessel projection weight maps: "
+        f"path={weight_path}, views={attached}, "
+        f"lambda_v={float(getattr(opt, 'vessel_projection_weight', 0.0))}, "
+        f"use_weighted_residual={use_weighted_residual}, "
+        f"use_vessel_edge={use_vessel_edge}, "
+        f"lambda_edge={float(getattr(opt, 'lambda_vessel_projection_edge', 0.0))}, "
+        f"cache_shape={list(train_weights.shape)}, "
+        f"min={float(train_weights.min()):.6f}, max={float(train_weights.max()):.6f}, "
+        f"mean={float(train_weights.mean()):.6f}"
+    )
+    return True
+
+
+def _save_vessel_projection_debug(
+    model_path,
+    iteration,
+    camera,
+    prediction,
+    target,
+    vessel_weight,
+    vessel_projection_weight,
+):
+    out_dir = os.path.join(
+        model_path,
+        "vessel_projection_debug",
+        f"iteration_{int(iteration)}",
+        f"view_{int(getattr(camera, 'colmap_id', camera.uid)):03d}",
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    residual = torch.abs(prediction.detach() - target.detach())
+    residual_weight = 1.0 + float(vessel_projection_weight) * vessel_weight.detach()
+    weighted_residual = residual * residual_weight
+    imageio.imwrite(os.path.join(out_dir, "observed.png"), _to_numpy_image(target))
+    imageio.imwrite(os.path.join(out_dir, "vessel_weight.png"), _to_numpy_image(vessel_weight))
+    imageio.imwrite(os.path.join(out_dir, "predicted.png"), _to_numpy_image(prediction))
+    imageio.imwrite(os.path.join(out_dir, "absolute_residual.png"), _to_numpy_image(residual))
+    imageio.imwrite(os.path.join(out_dir, "weighted_residual.png"), _to_numpy_image(weighted_residual))
+
+
+def _paper_management_config(opt):
+    return PaperVesselManagementConfig(
+        lambda_q=getattr(opt, "paper_management_lambda_q", 1.0),
+        lambda_def=getattr(opt, "paper_management_lambda_def", 1.0),
+        delta=getattr(opt, "paper_management_delta", 0.25),
+        lambda_m=getattr(opt, "paper_management_lambda_m", 1.0),
+        lambda_eta=getattr(opt, "paper_management_lambda_eta", 1.0),
+        lambda_k=getattr(opt, "paper_management_lambda_k", 1.0),
+        tau_keep=getattr(opt, "paper_management_tau_keep", 0.05),
+        tau_den=getattr(opt, "paper_management_tau_den", getattr(opt, "densify_grad_threshold", 0.00004)),
+        tau_s=getattr(opt, "paper_management_tau_s", 0.008),
+        eps=getattr(opt, "paper_management_eps", 1e-8),
+        prior_align_corners=getattr(opt, "paper_management_prior_align_corners", True),
+    )
+
+
+def _load_training_checkpoint(checkpoint):
+    payload = torch.load(checkpoint, weights_only=False)
+    if isinstance(payload, dict) and "gaussians" in payload:
+        return payload["gaussians"], int(payload["iteration"]), payload.get("dynamic_prior_state")
+    model_params, iteration = payload
+    return model_params, int(iteration), None
+
+
+def _make_training_checkpoint(gaussians, iteration, dynamic_prior_manager=None):
+    if dynamic_prior_manager is not None and dynamic_prior_manager.enabled:
+        return {
+            "gaussians": gaussians.capture(),
+            "iteration": int(iteration),
+            "dynamic_prior_state": dynamic_prior_manager.state_dict(current_iteration=iteration),
+        }
+    return (gaussians.capture(), int(iteration))
+
+
+def _save_training_checkpoint(path, gaussians, iteration, dynamic_prior_manager=None):
+    path = os.fspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(_make_training_checkpoint(gaussians, iteration, dynamic_prior_manager), path)
+
+
+def _build_prior_runtime(dataset, opt, scene, exp_logger):
+    vessel_projection_active = _attach_vessel_projection_weights(scene, opt, exp_logger)
     refinement_controller = None
     prior_analysis_controller = None
     occupancy_loss = None
     volume_loss = None
     projection_support_controller = None
     topology_gaussian_controller = None
+    paper_management_enabled = bool(getattr(opt, "use_paper_vessel_management", False))
+    paper_prior_sampler = None
+    paper_management_config = _paper_management_config(opt)
     if getattr(opt, "use_projection_support_loss", False):
         exp_logger.info(
             "Enabled projection support loss: "
@@ -83,7 +207,7 @@ def training(
             f"dilation={getattr(opt, 'projection_mask_dilation', 2)}, "
             f"margin={getattr(opt, 'projection_background_margin', 0.01)}"
         )
-    if getattr(opt, "use_projection_support_refinement", False):
+    if getattr(opt, "use_projection_support_refinement", False) or paper_management_enabled:
         projection_support_controller = ProjectionSupportController(
             cameras=scene.getTrainCameras(),
             foreground_threshold=getattr(
@@ -108,8 +232,10 @@ def training(
             chunk_size=getattr(opt, "projection_support_chunk_size", 100000),
         )
         exp_logger.info(
-            "Enabled projection support refinement: "
+            "Enabled projection support controller: "
             f"views={len(projection_support_controller.cameras)}, "
+            f"paper_management={paper_management_enabled}, "
+            f"legacy_refinement={bool(getattr(opt, 'use_projection_support_refinement', False))}, "
             f"from={getattr(opt, 'projection_support_from_iter', 4000)}, "
             f"until={getattr(opt, 'projection_support_until_iter', 15000)}, "
             f"interval={getattr(opt, 'projection_support_interval', 400)}, "
@@ -144,6 +270,12 @@ def training(
         exp_logger.info(f"Enabled prior allocation analysis: {analysis_description}")
     if getattr(opt, "use_topology_gaussian_prior", False):
         topology_prior_path = getattr(opt, "topology_prior_path", "")
+        if (
+            bool(getattr(opt, "enable_dynamic_prior", False))
+            and int(getattr(opt, "dynamic_prior_current_round", 0)) > 0
+            and getattr(opt, "refinement_prior_path", "")
+        ):
+            topology_prior_path = getattr(opt, "refinement_prior_path", "")
         topology_base_prior_path = getattr(opt, "refinement_prior_path", "") or getattr(dataset, "prior_path", "")
         if not topology_base_prior_path:
             raise ValueError("use_topology_gaussian_prior requires prior_path or refinement_prior_path")
@@ -196,6 +328,34 @@ def training(
             f"source={getattr(opt, 'occ_source', 'roi')}, grid={getattr(opt, 'occ_grid_size', 32)}, "
             f"type={getattr(opt, 'occ_loss_type', 'l1')}, lambda={getattr(opt, 'lambda_occ', 0.001)}"
         )
+    if paper_management_enabled:
+        paper_prior_path = getattr(opt, "refinement_prior_path", "") or getattr(dataset, "prior_path", "")
+        if not paper_prior_path:
+            raise ValueError("use_paper_vessel_management requires refinement_prior_path or prior_path")
+        if occupancy_loss is None:
+            raise ValueError("use_paper_vessel_management requires use_occ_loss=true to reuse O_r/O_p")
+        paper_prior_sampler = FixedPriorVolume(
+            prior_path=paper_prior_path,
+            volume_positions=scene.volume_positions,
+            source=getattr(opt, "paper_management_prior_source", "soft"),
+            align_corners=getattr(opt, "paper_management_prior_align_corners", True),
+        )
+        save_json(
+            os.path.join(dataset.model_path, "paper_vessel_management", "fixed_prior_description.json"),
+            paper_prior_sampler.description(),
+        )
+        exp_logger.info(
+            "Enabled paper vessel management: "
+            f"prior={paper_prior_path}, "
+            f"prior_key={paper_prior_sampler.prior_key}, "
+            f"occ_grid={getattr(opt, 'occ_grid_size', 32)}, "
+            f"projection_views={len(projection_support_controller.cameras)}, "
+            f"lambda_q={paper_management_config.lambda_q}, "
+            f"lambda_def={paper_management_config.lambda_def}, "
+            f"tau_keep={paper_management_config.tau_keep}, "
+            f"tau_den={paper_management_config.tau_den}, "
+            f"tau_s={paper_management_config.tau_s}"
+        )
     if getattr(opt, "use_volume_loss", False):
         volume_prior_path = getattr(opt, "refinement_prior_path", "") or getattr(dataset, "prior_path", "")
         volume_loss = LowResVolumeLoss(
@@ -241,11 +401,69 @@ def training(
             f"warmup={getattr(opt, 'volume_warmup_from_iter', 1000)}, "
             f"tissue_balance={getattr(opt, 'volume_tissue_balance', False)}"
         )
+    return {
+        "vessel_projection_active": vessel_projection_active,
+        "refinement_controller": refinement_controller,
+        "prior_analysis_controller": prior_analysis_controller,
+        "occupancy_loss": occupancy_loss,
+        "volume_loss": volume_loss,
+        "projection_support_controller": projection_support_controller,
+        "topology_gaussian_controller": topology_gaussian_controller,
+        "paper_management_enabled": paper_management_enabled,
+        "paper_prior_sampler": paper_prior_sampler,
+        "paper_management_config": paper_management_config,
+    }
+
+
+def training(
+    dataset,
+    opt,
+    pipe,
+    testing_iterations,
+    saving_iterations,
+    checkpoint_iterations,
+    checkpoint,
+    debug_from,
+    render_iterations,
+    analysis_iterations,
+):
+    first_iter = 0
+    dataset.density_render_mode = getattr(pipe, "density_render_mode", "legacy")
+    dataset.density_render_constant_color = getattr(
+        pipe,
+        "density_render_constant_color",
+        False,
+    )
+    exp_logger = prepare_output_and_logger(dataset)
+    exp_logger.info("Training parameters: {}".format(vars(opt)))
+    exp_logger.info("Pipeline parameters: {}".format(vars(pipe)))
+
+    gaussians = GaussianModel_Xray(dataset.sh_degree)
+    scene = Scene(dataset, gaussians)
+    save_dataset_split(dataset.model_path, scene)
+    gaussians.training_setup(opt)
+    checkpoint_dynamic_state = None
+    if checkpoint:
+        model_params, first_iter, checkpoint_dynamic_state = _load_training_checkpoint(checkpoint)
+        gaussians.restore(model_params, opt)
+    dynamic_prior_manager = DynamicPriorManager(dataset, opt, scene.volume_positions)
+    dynamic_prior_manager.restore(checkpoint_dynamic_state, first_iter)
+    dynamic_prior_manager.apply_to_args(dataset, opt)
+
+    runtime = _build_prior_runtime(dataset, opt, scene, exp_logger)
+    vessel_projection_active = runtime["vessel_projection_active"]
+    refinement_controller = runtime["refinement_controller"]
+    prior_analysis_controller = runtime["prior_analysis_controller"]
+    occupancy_loss = runtime["occupancy_loss"]
+    volume_loss = runtime["volume_loss"]
+    projection_support_controller = runtime["projection_support_controller"]
+    topology_gaussian_controller = runtime["topology_gaussian_controller"]
+    paper_management_enabled = runtime["paper_management_enabled"]
+    paper_prior_sampler = runtime["paper_prior_sampler"]
+    paper_management_config = runtime["paper_management_config"]
     if getattr(dataset, "save_init_analysis", False):
         save_init_statistics(dataset.model_path, scene.init_info, gaussians)
-    if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
-        gaussians.restore(model_params, opt)
+    dynamic_prior_manager.save_initial_snapshot(opt, iteration=first_iter)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -255,6 +473,7 @@ def training(
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
+    vessel_projection_debug_saved = 0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     training_wall_start = time.time()
@@ -284,7 +503,13 @@ def training(
 
         gt_image = viewpoint_cam.normalized_image.cuda()
 
-        Ll1 = l1_loss(image, gt_image)
+        vessel_weight_map = getattr(viewpoint_cam, "vessel_projection_weight", None)
+        Ll1, vessel_projection_stats = vessel_weighted_l1_loss(
+            image,
+            gt_image,
+            vessel_weight_map=vessel_weight_map if vessel_projection_active else None,
+            vessel_projection_weight=getattr(opt, "vessel_projection_weight", 0.0),
+        )
         ssim_term = 1.0 - ssim(image, gt_image)
         base_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_term
         projection_foreground_loss = torch.zeros((), dtype=image.dtype, device=image.device)
@@ -316,6 +541,17 @@ def training(
                 edge_loss_value = sobel_edge_loss(image, gt_image)
             else:
                 raise ValueError(f"Unsupported edge_loss_mask_mode: {edge_mask_mode}")
+        vessel_projection_edge_loss = torch.zeros((), dtype=image.dtype, device=image.device)
+        vessel_projection_edge_stats = {}
+        if getattr(opt, "use_vessel_projection_edge_loss", False):
+            vessel_projection_edge_loss, vessel_projection_edge_stats = vessel_weighted_sobel_loss(
+                image,
+                gt_image,
+                vessel_weight_map=vessel_weight_map if vessel_projection_active else None,
+                vessel_edge_weight=getattr(opt, "vessel_projection_edge_weight", 1.0),
+                vessel_edge_threshold=getattr(opt, "vessel_projection_edge_threshold", 0.15),
+                vessel_edge_dilation=getattr(opt, "vessel_projection_edge_dilation", 1),
+            )
         occ_loss_value = torch.zeros((), dtype=image.dtype, device=image.device)
         occ_stats = {}
         occ_gaussian_grid = None
@@ -374,6 +610,7 @@ def training(
             + getattr(opt, "lambda_projection_foreground", 0.0) * projection_foreground_loss
             + getattr(opt, "lambda_projection_background", 0.0) * projection_background_loss
             + getattr(opt, "edge_loss_weight", 0.0) * edge_loss_value
+            + getattr(opt, "lambda_vessel_projection_edge", 0.0) * vessel_projection_edge_loss
             + getattr(opt, "lambda_occ", 0.0) * occ_loss_value
             + getattr(opt, "lambda_volume", 0.0) * volume_loss_value
             + getattr(opt, "lambda_scale_floor", 0.0) * scale_floor_loss
@@ -401,6 +638,18 @@ def training(
                         "ssim_loss": float(ssim_term.item()),
                         "base_loss": float(base_loss.item()),
                         "lambda_render": float(getattr(opt, "lambda_render", 1.0)),
+                        "use_vessel_weighted_projection": bool(vessel_projection_active),
+                        "vessel_projection_weight": float(getattr(opt, "vessel_projection_weight", 0.0)),
+                        **{
+                            key: (
+                                bool(value)
+                                if isinstance(value, bool)
+                                else float(value.item())
+                                if torch.is_tensor(value)
+                                else float(value)
+                            )
+                            for key, value in vessel_projection_stats.items()
+                        },
                         "use_projection_support_loss": bool(
                             getattr(opt, "use_projection_support_loss", False)
                         ),
@@ -430,6 +679,32 @@ def training(
                         "edge_loss_mask_mode": getattr(opt, "edge_loss_mask_mode", "none"),
                         "edge_mask_quantile": float(getattr(opt, "edge_mask_quantile", 0.80)),
                         "edge_mask_dilation": int(getattr(opt, "edge_mask_dilation", 1)),
+                        "vessel_projection_edge_loss": float(vessel_projection_edge_loss.item()),
+                        "use_vessel_projection_edge_loss": bool(
+                            getattr(opt, "use_vessel_projection_edge_loss", False)
+                        ),
+                        "lambda_vessel_projection_edge": float(
+                            getattr(opt, "lambda_vessel_projection_edge", 0.0)
+                        ),
+                        "vessel_projection_edge_weight": float(
+                            getattr(opt, "vessel_projection_edge_weight", 1.0)
+                        ),
+                        "vessel_projection_edge_threshold": float(
+                            getattr(opt, "vessel_projection_edge_threshold", 0.15)
+                        ),
+                        "vessel_projection_edge_dilation": int(
+                            getattr(opt, "vessel_projection_edge_dilation", 1)
+                        ),
+                        **{
+                            key: (
+                                bool(value)
+                                if isinstance(value, bool)
+                                else float(value.item())
+                                if torch.is_tensor(value)
+                                else float(value)
+                            )
+                            for key, value in vessel_projection_edge_stats.items()
+                        },
                         "occ_loss": float(occ_loss_value.item()),
                         "lambda_occ": float(getattr(opt, "lambda_occ", 0.0)),
                         "use_occ_loss": bool(getattr(opt, "use_occ_loss", False)),
@@ -467,6 +742,25 @@ def training(
                     occ_prior_grid,
                     os.path.join(dataset.model_path, "occupancy_debug", f"iteration_{iteration}"),
                 )
+            debug_interval = int(getattr(opt, "vessel_projection_debug_interval", 0))
+            debug_view_limit = int(getattr(opt, "vessel_projection_debug_views", 4))
+            if (
+                vessel_projection_active
+                and debug_interval > 0
+                and iteration % debug_interval == 0
+                and vessel_weight_map is not None
+                and vessel_projection_debug_saved < debug_view_limit
+            ):
+                _save_vessel_projection_debug(
+                    dataset.model_path,
+                    iteration,
+                    viewpoint_cam,
+                    image,
+                    gt_image,
+                    vessel_weight_map,
+                    getattr(opt, "vessel_projection_weight", 0.0),
+                )
+                vessel_projection_debug_saved += 1
             if (
                 volume_loss is not None
                 and volume_pred_grid is not None
@@ -480,6 +774,7 @@ def training(
                 )
             topology_prune_only_active = (
                 topology_gaussian_controller is not None
+                and not paper_management_enabled
                 and getattr(opt, "topology_empty_prune_enabled", False)
                 and iteration >= getattr(opt, "topology_empty_prune_from_iter", 10000)
                 and iteration <= getattr(opt, "topology_prune_only_until_iter", opt.iterations)
@@ -555,132 +850,188 @@ def training(
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    grad_multipliers = None
-                    extra_prune_mask = None
-                    prune_protect_mask = None
-                    densify_region_mask = None
-                    projection_support_stats = {}
-                    topology_stats = {}
-                    if refinement_controller is not None and iteration >= getattr(opt, "refinement_from_iter", 0):
-                        refinement_grad_multipliers, refinement_extra_prune_mask, refinement_stats = refinement_controller.build_iteration_bias(gaussians)
-                        if getattr(opt, "roi_densify_enabled", False):
-                            grad_multipliers = refinement_grad_multipliers
-                        if getattr(opt, "empty_prune_enabled", False):
-                            extra_prune_mask = refinement_extra_prune_mask
+                    if paper_management_enabled:
+                        num_gaussians_before = int(gaussians.get_xyz.shape[0])
+                        paper_result = compute_paper_vessel_management(
+                            gaussians=gaussians,
+                            prior_sampler=paper_prior_sampler,
+                            occupancy_loss=occupancy_loss,
+                            projection_support_controller=projection_support_controller,
+                            config=paper_management_config,
+                        )
+                        num_prune = int(paper_result["prune_mask"].sum().item())
+                        num_clone = int(paper_result["clone_mask"].sum().item())
+                        num_split = int(paper_result["split_mask"].sum().item())
+                        num_retain = int(paper_result["retain_mask"].sum().item())
+                        split_children = int(getattr(opt, "paper_management_split_children", 2))
+                        management_stats = gaussians.apply_vessel_aware_management(
+                            paper_result["prune_mask"],
+                            paper_result["clone_mask"],
+                            paper_result["split_mask"],
+                            paper_result["retain_mask"],
+                            split_children=split_children,
+                        )
+                        num_gaussians_after = int(gaussians.get_xyz.shape[0])
                         append_jsonl(
-                            os.path.join(dataset.model_path, "refinement", "refinement_history.jsonl"),
+                            os.path.join(dataset.model_path, "paper_vessel_management", "management_history.jsonl"),
                             {
                                 "iteration": int(iteration),
-                                "roi_densify_enabled": bool(getattr(opt, "roi_densify_enabled", False)),
-                                "empty_prune_enabled": bool(getattr(opt, "empty_prune_enabled", False)),
-                                **refinement_stats,
+                                "management_mode": "paper_vessel_management",
+                                "num_gaussians_before": num_gaussians_before,
+                                "num_gaussians_after": num_gaussians_after,
+                                "num_prune": num_prune,
+                                "num_clone": num_clone,
+                                "num_split": num_split,
+                                "num_retain": num_retain,
+                                "split_children": split_children,
+                                "legacy_opacity_pruning_enabled": False,
+                                "legacy_effective_density_pruning_enabled": False,
+                                "legacy_size_pruning_enabled": False,
+                                "fixed_prior_key": paper_prior_sampler.prior_key,
+                                **paper_result["stats"],
+                                **management_stats,
                             },
                         )
-                    topology_prior_active = (
-                        topology_gaussian_controller is not None
-                        and iteration >= getattr(opt, "topology_prior_from_iter", 5000)
-                    )
-                    if topology_prior_active:
-                        centerline_active = iteration >= getattr(opt, "topology_centerline_from_iter", 8000)
-                        empty_prune_active = iteration >= getattr(opt, "topology_empty_prune_from_iter", 10000)
-                        (
-                            topology_grad_multipliers,
-                            topology_prune_mask,
-                            topology_protect_mask,
-                            topology_region_mask,
-                            topology_stats,
-                        ) = topology_gaussian_controller.build_iteration_bias(
-                            gaussians,
-                            centerline_active=centerline_active,
-                            empty_prune_active=empty_prune_active,
-                        )
-                        topology_grad_multipliers = topology_grad_multipliers.reshape(-1, 1)
-                        if grad_multipliers is None:
-                            grad_multipliers = topology_grad_multipliers
-                        else:
-                            grad_multipliers = grad_multipliers.reshape(-1, 1) * topology_grad_multipliers
-                        if extra_prune_mask is None:
-                            extra_prune_mask = topology_prune_mask
-                        else:
-                            extra_prune_mask = torch.logical_or(extra_prune_mask, topology_prune_mask)
-                        if prune_protect_mask is None:
-                            prune_protect_mask = topology_protect_mask
-                        else:
-                            prune_protect_mask = torch.logical_or(prune_protect_mask, topology_protect_mask)
-                        densify_region_mask = topology_region_mask
-                        append_jsonl(
-                            os.path.join(dataset.model_path, "topology_gaussian_prior", "history.jsonl"),
-                            {
-                                "iteration": int(iteration),
-                                "topology_prior_active": bool(topology_prior_active),
-                                **topology_stats,
-                            },
-                        )
-                    projection_support_active = (
-                        projection_support_controller is not None
-                        and iteration >= getattr(opt, "projection_support_from_iter", 4000)
-                        and iteration <= getattr(opt, "projection_support_until_iter", 15000)
-                        and iteration % max(
-                            1,
-                            int(getattr(opt, "projection_support_interval", 400)),
-                        ) == 0
-                    )
-                    if projection_support_active:
-                        (
-                            support_grad_multipliers,
-                            support_prune_mask,
-                            projection_support_stats,
-                        ) = projection_support_controller.evaluate(gaussians)
-                        support_grad_multipliers = support_grad_multipliers.reshape(-1, 1)
-                        if grad_multipliers is None:
-                            grad_multipliers = support_grad_multipliers
-                        else:
-                            grad_multipliers = grad_multipliers.reshape(-1, 1)
-                            grad_multipliers = (
-                                grad_multipliers * support_grad_multipliers
+                        exp_logger.info(
+                            "[ITER {}] Paper vessel management: before={}, after={}, "
+                            "prune={}, clone={}, split={}, retain={}".format(
+                                iteration,
+                                num_gaussians_before,
+                                num_gaussians_after,
+                                num_prune,
+                                num_clone,
+                                num_split,
+                                num_retain,
                             )
-                        if extra_prune_mask is None:
-                            extra_prune_mask = support_prune_mask
-                        else:
-                            extra_prune_mask = torch.logical_or(
-                                extra_prune_mask,
+                        )
+                    else:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        grad_multipliers = None
+                        extra_prune_mask = None
+                        prune_protect_mask = None
+                        densify_region_mask = None
+                        projection_support_stats = {}
+                        topology_stats = {}
+                        if refinement_controller is not None and iteration >= getattr(opt, "refinement_from_iter", 0):
+                            refinement_grad_multipliers, refinement_extra_prune_mask, refinement_stats = refinement_controller.build_iteration_bias(gaussians)
+                            if getattr(opt, "roi_densify_enabled", False):
+                                grad_multipliers = refinement_grad_multipliers
+                            if getattr(opt, "empty_prune_enabled", False):
+                                extra_prune_mask = refinement_extra_prune_mask
+                            append_jsonl(
+                                os.path.join(dataset.model_path, "refinement", "refinement_history.jsonl"),
+                                {
+                                    "iteration": int(iteration),
+                                    "roi_densify_enabled": bool(getattr(opt, "roi_densify_enabled", False)),
+                                    "empty_prune_enabled": bool(getattr(opt, "empty_prune_enabled", False)),
+                                    **refinement_stats,
+                                },
+                            )
+                        topology_prior_active = (
+                            topology_gaussian_controller is not None
+                            and iteration >= getattr(opt, "topology_prior_from_iter", 5000)
+                        )
+                        if topology_prior_active:
+                            centerline_active = iteration >= getattr(opt, "topology_centerline_from_iter", 8000)
+                            empty_prune_active = iteration >= getattr(opt, "topology_empty_prune_from_iter", 10000)
+                            (
+                                topology_grad_multipliers,
+                                topology_prune_mask,
+                                topology_protect_mask,
+                                topology_region_mask,
+                                topology_stats,
+                            ) = topology_gaussian_controller.build_iteration_bias(
+                                gaussians,
+                                centerline_active=centerline_active,
+                                empty_prune_active=empty_prune_active,
+                            )
+                            topology_grad_multipliers = topology_grad_multipliers.reshape(-1, 1)
+                            if grad_multipliers is None:
+                                grad_multipliers = topology_grad_multipliers
+                            else:
+                                grad_multipliers = grad_multipliers.reshape(-1, 1) * topology_grad_multipliers
+                            if extra_prune_mask is None:
+                                extra_prune_mask = topology_prune_mask
+                            else:
+                                extra_prune_mask = torch.logical_or(extra_prune_mask, topology_prune_mask)
+                            if prune_protect_mask is None:
+                                prune_protect_mask = topology_protect_mask
+                            else:
+                                prune_protect_mask = torch.logical_or(prune_protect_mask, topology_protect_mask)
+                            densify_region_mask = topology_region_mask
+                            append_jsonl(
+                                os.path.join(dataset.model_path, "topology_gaussian_prior", "history.jsonl"),
+                                {
+                                    "iteration": int(iteration),
+                                    "topology_prior_active": bool(topology_prior_active),
+                                    **topology_stats,
+                                },
+                            )
+                        projection_support_active = (
+                            projection_support_controller is not None
+                            and getattr(opt, "use_projection_support_refinement", False)
+                            and iteration >= getattr(opt, "projection_support_from_iter", 4000)
+                            and iteration <= getattr(opt, "projection_support_until_iter", 15000)
+                            and iteration % max(
+                                1,
+                                int(getattr(opt, "projection_support_interval", 400)),
+                            ) == 0
+                        )
+                        if projection_support_active:
+                            (
+                                support_grad_multipliers,
                                 support_prune_mask,
-                            )
-                    configured_prune_density_mode = getattr(opt, "prune_density_mode", "opacity")
-                    prune_density_mode = (
-                        configured_prune_density_mode
-                        if iteration >= getattr(opt, "prune_density_from_iter", 0)
-                        else "opacity"
-                    )
-                    densification_stats = gaussians.densify_and_prune(
-                        opt.densify_grad_threshold,
-                        getattr(opt, "densify_min_opacity", 0.005),
-                        scene.cameras_extent,
-                        size_threshold,
-                        grad_multipliers=grad_multipliers,
-                        extra_prune_mask=extra_prune_mask,
-                        density_aware_pruning=getattr(opt, "density_aware_pruning", False),
-                        min_radiodensity=getattr(opt, "prune_min_radiodensity", 0.02),
-                        prune_density_mode=prune_density_mode,
-                        min_effective_density=getattr(opt, "prune_min_effective_density", 0.0),
-                        prune_protect_mask=prune_protect_mask,
-                        densify_region_mask=densify_region_mask,
-                    )
-                    append_jsonl(
-                        os.path.join(dataset.model_path, "densification_history.jsonl"),
-                        {
-                            "iteration": int(iteration),
-                            "grad_threshold": float(opt.densify_grad_threshold),
-                            "configured_prune_density_mode": configured_prune_density_mode,
-                            "prune_density_from_iter": int(getattr(opt, "prune_density_from_iter", 0)),
-                            "projection_support_active": bool(projection_support_active),
-                            "topology_prior_active": bool(topology_prior_active),
-                            **projection_support_stats,
-                            **topology_stats,
-                            **densification_stats,
-                        },
-                    )
+                                projection_support_stats,
+                            ) = projection_support_controller.evaluate(gaussians)
+                            support_grad_multipliers = support_grad_multipliers.reshape(-1, 1)
+                            if grad_multipliers is None:
+                                grad_multipliers = support_grad_multipliers
+                            else:
+                                grad_multipliers = grad_multipliers.reshape(-1, 1)
+                                grad_multipliers = (
+                                    grad_multipliers * support_grad_multipliers
+                                )
+                            if extra_prune_mask is None:
+                                extra_prune_mask = support_prune_mask
+                            else:
+                                extra_prune_mask = torch.logical_or(
+                                    extra_prune_mask,
+                                    support_prune_mask,
+                                )
+                        configured_prune_density_mode = getattr(opt, "prune_density_mode", "opacity")
+                        prune_density_mode = (
+                            configured_prune_density_mode
+                            if iteration >= getattr(opt, "prune_density_from_iter", 0)
+                            else "opacity"
+                        )
+                        densification_stats = gaussians.densify_and_prune(
+                            opt.densify_grad_threshold,
+                            getattr(opt, "densify_min_opacity", 0.005),
+                            scene.cameras_extent,
+                            size_threshold,
+                            grad_multipliers=grad_multipliers,
+                            extra_prune_mask=extra_prune_mask,
+                            density_aware_pruning=getattr(opt, "density_aware_pruning", False),
+                            min_radiodensity=getattr(opt, "prune_min_radiodensity", 0.02),
+                            prune_density_mode=prune_density_mode,
+                            min_effective_density=getattr(opt, "prune_min_effective_density", 0.0),
+                            prune_protect_mask=prune_protect_mask,
+                            densify_region_mask=densify_region_mask,
+                        )
+                        append_jsonl(
+                            os.path.join(dataset.model_path, "densification_history.jsonl"),
+                            {
+                                "iteration": int(iteration),
+                                "grad_threshold": float(opt.densify_grad_threshold),
+                                "configured_prune_density_mode": configured_prune_density_mode,
+                                "prune_density_from_iter": int(getattr(opt, "prune_density_from_iter", 0)),
+                                "projection_support_active": bool(projection_support_active),
+                                "topology_prior_active": bool(topology_prior_active),
+                                **projection_support_stats,
+                                **topology_stats,
+                                **densification_stats,
+                            },
+                        )
 
                 if iteration % opt.opacity_reset_interval == 0 or (
                         dataset.white_background and iteration == opt.densify_from_iter):
@@ -690,9 +1041,61 @@ def training(
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
 
+            dynamic_event = dynamic_prior_manager.update_after_iteration(
+                iteration,
+                gaussians,
+                opt,
+                dataset.source_path,
+                checkpoint_callback=lambda path, it: _save_training_checkpoint(
+                    path,
+                    gaussians,
+                    it,
+                    dynamic_prior_manager,
+                ),
+            )
+            if dynamic_event is not None:
+                dynamic_prior_manager.apply_to_args(dataset, opt)
+                runtime = _build_prior_runtime(dataset, opt, scene, exp_logger)
+                vessel_projection_active = runtime["vessel_projection_active"]
+                refinement_controller = runtime["refinement_controller"]
+                prior_analysis_controller = runtime["prior_analysis_controller"]
+                occupancy_loss = runtime["occupancy_loss"]
+                volume_loss = runtime["volume_loss"]
+                projection_support_controller = runtime["projection_support_controller"]
+                topology_gaussian_controller = runtime["topology_gaussian_controller"]
+                paper_management_enabled = runtime["paper_management_enabled"]
+                paper_prior_sampler = runtime["paper_prior_sampler"]
+                paper_management_config = runtime["paper_management_config"]
+                dynamic_checkpoint_dir = os.path.join(
+                    dataset.model_path,
+                    getattr(opt, "dynamic_prior_output_dir", "dynamic_prior"),
+                    f"round{dynamic_prior_manager.current_prior_round}",
+                    "checkpoint",
+                )
+                _save_training_checkpoint(
+                    os.path.join(dynamic_checkpoint_dir, f"chkpnt_after_prior_update_{iteration}.pth"),
+                    gaussians,
+                    iteration,
+                    dynamic_prior_manager,
+                )
+                exp_logger.info(
+                    "[ITER {}] Dynamic prior update round {} complete: prior={}, projection_cache={}, elapsed={:.4f}s".format(
+                        iteration,
+                        dynamic_prior_manager.current_prior_round,
+                        dynamic_prior_manager.current_prior_path,
+                        dynamic_prior_manager.current_projection_cache_path,
+                        dynamic_event["elapsed_sec"],
+                    )
+                )
+
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                _save_training_checkpoint(
+                    os.path.join(scene.model_path, "chkpnt" + str(iteration) + ".pth"),
+                    gaussians,
+                    iteration,
+                    dynamic_prior_manager,
+                )
 
     total_training_time = time.time() - training_wall_start
     exp_logger.info(f"Training completed in {total_training_time:.4f} s")
