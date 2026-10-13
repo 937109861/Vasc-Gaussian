@@ -1,0 +1,17 @@
+{
+  "name": "@jet-vasc/agh-vasc-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "UNLICENSED",
+  "exports": "./index.mjs",
+  "agnes": {
+    "plugins": [
+      {
+        "export": "vascGaussianTools",
+        "id": "ext:jet-vasc/vasc-gaussian",
+        "inject": ["extension"]
+      }
+    ]
+  }
+}

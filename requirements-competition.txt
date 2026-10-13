@@ -1,0 +1,7 @@
+# Add these to the existing x_gaussian environment for the AGH competition workflow.
+PyYAML
+numpy
+scipy
+scikit-image
+imageio
+Pillow

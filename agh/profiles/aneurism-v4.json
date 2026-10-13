@@ -1,0 +1,46 @@
+{
+  "id": "aneurism-v4",
+  "title": "Aneurism sparse-view reconstruction (v4)",
+  "description": "Current repository-backed aneurism configuration with DGR volume export and topology evaluation.",
+  "base_config": "configs/aneurism_lowres_v4_scalemax_loose.yaml",
+  "source_path": "data/aneurism_50.pickle",
+  "full_required_files": [
+    "output/priors/aneurism_vesselness_fused/prior_data.npz"
+  ],
+  "quick_overrides": {
+    "scene": "aneurism_agh_quick",
+    "iterations": 100,
+    "test_iterations": [100],
+    "save_iterations": [100],
+    "render_iterations": [100],
+    "analysis_iterations": [100],
+    "checkpoint_iterations": [],
+    "render_num_views": 4,
+    "prior_path": "",
+    "refinement_prior_path": "",
+    "save_init_analysis": false,
+    "use_projection_support_loss": false,
+    "use_occ_loss": false,
+    "use_volume_loss": false,
+    "use_gaussian_reg": false,
+    "volume_debug_interval": 0
+  },
+  "quick_export_max_gaussians": 10000,
+  "export": {
+    "mode": "dgr",
+    "density_mapping_mode": "effective_density",
+    "dgr_reference_grid_size": 128,
+    "dgr_splat_radius": 3,
+    "dgr_min_sigma_voxels": 0.30,
+    "dgr_max_sigma_voxels": 2.65,
+    "dgr_sigma_scale": 0.86,
+    "post_median_size": 1,
+    "post_smooth_sigma": 0.0,
+    "post_contrast_gamma": 1.0,
+    "slicer_export": true
+  },
+  "evaluation": {
+    "gt_positive_quantile": 0.05,
+    "small_component_max_voxels": 280
+  }
+}

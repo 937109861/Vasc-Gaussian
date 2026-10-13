@@ -20,6 +20,8 @@ submodules/*/build/
 
 tensorboard_3d/
 screenshots/
+agh_runs/
+agh/local/
 
 /*.png
 /*.pptx

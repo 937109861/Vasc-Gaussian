@@ -16,6 +16,18 @@
 Vasc-Gaussian: Vessel-Aware Radiative Gaussian Splatting for Sparse-View Cerebrovascular and Aneurysm Reconstruction
 ```
 
+## Agnes Harness 竞赛接入（VascPilot）
+
+仓库现包含一个面向 AI+科学与工程实践的 Agnes Harness 接入层。它把现有训练、渲染、体数据导出和拓扑评估封装为受信任工具，形成“预检 -> 审批 -> 执行 -> 反馈 -> 验证 -> 对比”的闭环，同时禁止智能体提交任意终端命令。
+
+- 部署与操作：[`docs/HACKATHON_AGH_GUIDE.md`](docs/HACKATHON_AGH_GUIDE.md)
+- 参赛说明草稿：[`docs/COMPETITION_SUBMISSION.md`](docs/COMPETITION_SUBMISSION.md)
+- AGH 插件和安全桥：[`agh/`](agh/)
+- AGH Skill：[`.agh/skills/vasc-reconstruction/SKILL.md`](.agh/skills/vasc-reconstruction/SKILL.md)
+- 第三方与赛前工作披露：[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)
+
+`quick` 模式仅用于验证端到端执行链路，不代表最终科学结果；正式指标必须来自 `full` 运行。模型 Key、原始私有数据和运行追踪不得提交到 Git。
+
 ## 1. 项目解决的问题
 
 传统 sparse-view CT / X-ray 血管重建通常面临几个问题：
